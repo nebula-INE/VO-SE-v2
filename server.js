@@ -297,12 +297,205 @@ class VoicebankRegistryEngine {
 const vbRegistry = new VoicebankRegistryEngine();
 
 // ============================================================
-// ZIP解凍（ストリーミング / 低メモリ）
 // ============================================================
-// ★修正: adm-zip（ZIP全体を一括メモリ展開・同期実行）から、
-//         yauzl によるストリーミング解凍に変更。
-//         1エントリずつ読み込み→書き込み→次へ、という流れで
-//         ZIP全体や展開後の全ファイルを同時にRAM上に保持しない。
+// Human Vocal Formant & Glottal Pulse Generator
+// ============================================================
+function createHumanVocalWavBuffer(phoneme, baseFreq = 261.63) {
+  const sampleRate = 44100;
+  const duration = 1.0;
+  const numSamples = Math.floor(sampleRate * duration);
+  const pcmDataLen = numSamples * 2;
+  const buffer = Buffer.alloc(44 + pcmDataLen);
+
+  // RIFF WAV Header
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + pcmDataLen, 4);
+  buffer.write('WAVE', 8);
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // PCM
+  buffer.writeUInt16LE(1, 22); // Mono
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28);
+  buffer.writeUInt16LE(2, 32);  // BlockAlign
+  buffer.writeUInt16LE(16, 34); // BitsPerSample
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(pcmDataLen, 40);
+
+  const formantTable = {
+    'a': { f1: 800, f2: 1250, f3: 2600, bw1: 80, bw2: 100, bw3: 120 },
+    'i': { f1: 300, f2: 2300, f3: 3000, bw1: 50, bw2: 110, bw3: 140 },
+    'u': { f1: 350, f2: 1200, f3: 2300, bw1: 60, bw2: 90,  bw3: 130 },
+    'e': { f1: 500, f2: 1900, f3: 2600, bw1: 70, bw2: 110, bw3: 130 },
+    'o': { f1: 450, f2: 800,  f3: 2500, bw1: 70, bw2: 80,  bw3: 120 },
+    'n': { f1: 250, f2: 1000, f3: 2200, bw1: 40, bw2: 100, bw3: 150 }
+  };
+
+  let vowel = 'a';
+  let consonantType = null;
+  const str = (phoneme || '').toLowerCase();
+
+  if (str.includes('い') || str.includes('i') || str.endsWith('i')) vowel = 'i';
+  else if (str.includes('う') || str.includes('u') || str.endsWith('u')) vowel = 'u';
+  else if (str.includes('え') || str.includes('e') || str.endsWith('e')) vowel = 'e';
+  else if (str.includes('お') || str.includes('o') || str.endsWith('o')) vowel = 'o';
+  else if (str.includes('ん') || str.includes('n')) vowel = 'n';
+  else vowel = 'a';
+
+  if (str.includes('か') || str.includes('き') || str.includes('く') || str.includes('け') || str.includes('こ') || str.startsWith('k')) consonantType = 'k';
+  else if (str.includes('さ') || str.includes('し') || str.includes('す') || str.includes('せ') || str.includes('そ') || str.startsWith('s')) consonantType = 's';
+  else if (str.includes('た') || str.includes('ち') || str.includes('つ') || str.includes('て') || str.includes('と') || str.startsWith('t')) consonantType = 't';
+  else if (str.includes('な') || str.includes('に') || str.includes('ぬ') || str.includes('ね') || str.includes('の') || str.startsWith('n')) consonantType = 'n';
+  else if (str.includes('は') || str.includes('ひ') || str.includes('ふ') || str.includes('へ') || str.includes('ほ') || str.startsWith('h')) consonantType = 'h';
+  else if (str.includes('ま') || str.includes('み') || str.includes('む') || str.includes('め') || str.includes('も') || str.startsWith('m')) consonantType = 'm';
+  else if (str.includes('ら') || str.includes('り') || str.includes('る') || str.includes('れ') || str.includes('ろ') || str.startsWith('r')) consonantType = 'r';
+  else if (str.includes('が') || str.includes('ぎ') || str.includes('ぐ') || str.includes('げ') || str.includes('ご') || str.startsWith('g')) consonantType = 'g';
+  else if (str.includes('ざ') || str.includes('じ') || str.includes('ず') || str.includes('ぜ') || str.includes('ぞ') || str.startsWith('z')) consonantType = 'z';
+  else if (str.includes('だ') || str.includes('ぢ') || str.includes('づ') || str.includes('で') || str.includes('ど') || str.startsWith('d')) consonantType = 'd';
+  else if (str.includes('ば') || str.includes('び') || str.includes('ぶ') || str.includes('べ') || str.includes('ぼ') || str.startsWith('b')) consonantType = 'b';
+  else if (str.includes('ぱ') || str.includes('ぴ') || str.includes('ぷ') || str.includes('ぺ') || str.includes('ぽ') || str.startsWith('p')) consonantType = 'p';
+
+  const fmt = formantTable[vowel] || formantTable['a'];
+
+  function createResonator(f, bw) {
+    const r = Math.exp(-Math.PI * bw / sampleRate);
+    const cosTheta = Math.cos(2 * Math.PI * f / sampleRate);
+    const a1 = -2 * r * cosTheta;
+    const a2 = r * r;
+    const b0 = 1 - r;
+    let y1 = 0, y2 = 0;
+    return (x) => {
+      const y = b0 * x - a1 * y1 - a2 * y2;
+      y2 = y1;
+      y1 = y;
+      return y;
+    };
+  }
+
+  const res1 = createResonator(fmt.f1, fmt.bw1);
+  const res2 = createResonator(fmt.f2, fmt.bw2);
+  const res3 = createResonator(fmt.f3, fmt.bw3);
+
+  let phase = 0;
+  let noiseState = 0x12345;
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+
+    // Vibrato
+    const vibrato = Math.sin(2 * Math.PI * 5.5 * t) * 0.007;
+    const currentFreq = baseFreq * Math.pow(2, vibrato);
+    phase += currentFreq / sampleRate;
+    if (phase >= 1.0) phase -= 1.0;
+
+    // Glottal pulse excitation
+    let glottalPulse = 0;
+    if (phase < 0.4) {
+      glottalPulse = 0.5 * (1 - Math.cos(Math.PI * phase / 0.4));
+    } else if (phase < 0.55) {
+      glottalPulse = Math.cos(Math.PI * (phase - 0.4) / (0.15 * 2));
+    } else {
+      glottalPulse = 0;
+    }
+
+    let excitation = glottalPulse - 0.3;
+    excitation += Math.sin(2 * Math.PI * phase) * 0.3;
+    excitation += Math.sin(4 * Math.PI * phase) * 0.15;
+    excitation += Math.sin(6 * Math.PI * phase) * 0.08;
+
+    noiseState = (noiseState * 1664525 + 1013904223) % 4294967296;
+    const whiteNoise = (noiseState / 2147483648) - 1.0;
+
+    let consonantNoise = 0;
+    const consonantDur = 0.05;
+    if (consonantType && t < consonantDur) {
+      const cEnv = Math.sin(Math.PI * (t / consonantDur));
+      if (['k', 't', 'p', 'g', 'd', 'b'].includes(consonantType)) {
+        consonantNoise = whiteNoise * cEnv * 0.6;
+      } else if (['s', 'z', 'h'].includes(consonantType)) {
+        consonantNoise = whiteNoise * cEnv * 0.8;
+      } else {
+        consonantNoise = whiteNoise * cEnv * 0.3;
+      }
+    }
+
+    excitation += whiteNoise * 0.03 + consonantNoise;
+
+    const outputF1 = res1(excitation);
+    const outputF2 = res2(excitation);
+    const outputF3 = res3(excitation);
+
+    let vocalSound = outputF1 * 0.6 + outputF2 * 0.3 + outputF3 * 0.15;
+
+    let env = 1.0;
+    if (t < 0.02) env = t / 0.02;
+    else if (t > duration - 0.08) env = Math.max(0, (duration - t) / 0.08);
+
+    let sampleVal = Math.floor(vocalSound * env * 14000);
+    sampleVal = Math.max(-32768, Math.min(32767, sampleVal));
+
+    buffer.writeInt16LE(sampleVal, 44 + i * 2);
+  }
+
+  return buffer;
+}
+
+// Ensure built-in standard voicebanks exist with human vocal WAV files
+function ensureDefaultVoicebanks() {
+  const voicebanksDir = path.join(__dirname, 'temp', 'voicebanks');
+  if (!fs.existsSync(voicebanksDir)) {
+    fs.mkdirSync(voicebanksDir, { recursive: true });
+  }
+
+  const defaultModels = [
+    { name: 'Official Voice (VCV)', pitch: 261.63 },
+    { name: 'Standard Japanese CV', pitch: 261.63 },
+    { name: 'BigVGAN Neural Synth', pitch: 261.63 }
+  ];
+
+  const vowels = [
+    'あ', 'い', 'う', 'え', 'お', 'か', 'き', 'く', 'け', 'こ',
+    'さ', 'し', 'す', 'せ', 'そ', 'た', 'ち', 'つ', 'て', 'と',
+    'な', 'に', 'ぬ', 'ね', 'の', 'は', 'ひ', 'ふ', 'へ', 'ほ',
+    'ま', 'み', 'む', 'め', 'も', 'や', 'ゆ', 'よ', 'ら', 'り',
+    'る', 'れ', 'ろ', 'わ', 'を', 'ん', 'が', 'ぎ', 'ぐ', 'げ',
+    'ご', 'ざ', 'じ', 'ず', 'ぜ', 'ぞ', 'だ', 'ぢ', 'づ', 'で',
+    'ど', 'ば', 'び', 'ぶ', 'べ', 'ぼ', 'ぱ', 'ぴ', 'ぷ', 'ぺ', 'ぽ'
+  ];
+  const vcvPrefixes = ['- ', 'a ', 'i ', 'u ', 'e ', 'o ', 'n '];
+
+  for (const model of defaultModels) {
+    const targetDir = path.join(voicebanksDir, model.name);
+    const otoPath = path.join(targetDir, 'oto.ini');
+
+    if (!fs.existsSync(targetDir) || !fs.existsSync(otoPath)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+      const otoLines = [];
+
+      vowels.forEach((v, idx) => {
+        const wavName = `vocal_${String(idx).padStart(2, '0')}.wav`;
+        const wavPath = path.join(targetDir, wavName);
+        if (!fs.existsSync(wavPath)) {
+          fs.writeFileSync(wavPath, createHumanVocalWavBuffer(v, model.pitch));
+        }
+        otoLines.push(`${wavName}=${v},15,100,-40,25,10`);
+        vcvPrefixes.forEach(p => {
+          otoLines.push(`${wavName}=${p}${v},15,100,-40,25,10`);
+        });
+      });
+
+      fs.writeFileSync(otoPath, otoLines.join('\n'), { encoding: 'utf-8' });
+      fs.writeFileSync(path.join(targetDir, 'character.txt'), `name=${model.name}\nauthor=VO-SE Official\n`, { encoding: 'utf-8' });
+      vbRegistry.invalidate(model.name);
+    }
+  }
+}
+
+// Call on startup
+ensureDefaultVoicebanks();
+
+// ZIP解凍（ストリーミング / 低メモリ / Shift-JIS & NFC対応）
+// ============================================================
 function extractZipStreaming(zipPath, targetDir) {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(targetDir, { recursive: true });
@@ -313,8 +506,11 @@ function extractZipStreaming(zipPath, targetDir) {
       zipfile.readEntry();
 
       zipfile.on('entry', (entry) => {
-        // ZIP Slip対策: ".." を含むパスは無視
-        const safeName = entry.fileName.replace(/\\/g, '/');
+        // Shift-JIS / CP932 / UTF-8 Decoding
+        let rawName = entry.fileNameBuffer ? decodeTextBuffer(entry.fileNameBuffer) : entry.fileName;
+        rawName = rawName.normalize('NFC');
+        const safeName = rawName.replace(/\\/g, '/');
+
         if (safeName.includes('../') || path.isAbsolute(safeName)) {
           zipfile.readEntry();
           return;
@@ -323,7 +519,6 @@ function extractZipStreaming(zipPath, targetDir) {
         const entryPath = path.join(targetDir, safeName);
 
         if (/\/$/.test(safeName)) {
-          // ディレクトリエントリ
           fs.mkdirSync(entryPath, { recursive: true });
           zipfile.readEntry();
           return;
@@ -338,7 +533,6 @@ function extractZipStreaming(zipPath, targetDir) {
           readStream.pipe(writeStream);
 
           writeStream.on('close', () => {
-            // 1ファイル完了してから次を読む → 同時に複数ファイル分をRAMに溜めない
             zipfile.readEntry();
           });
           writeStream.on('error', reject);
@@ -385,45 +579,15 @@ app.post('/api/py/download-preset-voicebank', (req, res) => {
       fs.mkdirSync(targetDir, { recursive: true });
     }
 
-    const sampleRate = 44100;
-    const duration = 0.8;
-    const numSamples = Math.floor(sampleRate * duration);
-
-    // Generate PCM 16-bit Mono WAV Buffer
-    function createWavBuffer(freq) {
-      const pcmDataLen = numSamples * 2;
-      const buffer = Buffer.alloc(44 + pcmDataLen);
-
-      // RIFF Header
-      buffer.write('RIFF', 0);
-      buffer.writeUInt32LE(36 + pcmDataLen, 4);
-      buffer.write('WAVE', 8);
-      buffer.write('fmt ', 12);
-      buffer.writeUInt32LE(16, 16);
-      buffer.writeUInt16LE(1, 20); // PCM
-      buffer.writeUInt16LE(1, 22); // Mono
-      buffer.writeUInt32LE(sampleRate, 24);
-      buffer.writeUInt32LE(sampleRate * 2, 28);
-      buffer.writeUInt16LE(2, 32);  // BlockAlign
-      buffer.writeUInt16LE(16, 34); // BitsPerSample
-      buffer.write('data', 36);
-      buffer.writeUInt32LE(pcmDataLen, 40);
-
-      for (let i = 0; i < numSamples; i++) {
-        const t = i / sampleRate;
-        const val = Math.sin(2 * Math.PI * freq * t) * 0.6 + Math.sin(2 * Math.PI * freq * 2 * t) * 0.2;
-        let env = 1.0;
-        if (i < 2000) env = i / 2000;
-        else if (i > numSamples - 4000) env = Math.max(0, (numSamples - i) / 4000);
-
-        let sample = Math.floor(val * env * 16000);
-        sample = Math.max(-32768, Math.min(32767, sample));
-        buffer.writeInt16LE(sample, 44 + i * 2);
-      }
-      return buffer;
-    }
-
-    const vowels = ['あ', 'い', 'う', 'え', 'お', 'か', 'き', 'く', 'け', 'こ', 'さ', 'し', 'す', 'せ', 'そ', 'た', 'ち', 'つ', 'て', 'と', 'な', 'に', 'ぬ', 'ね', 'の', 'は', 'ひ', 'ふ', 'へ', 'ほ', 'ま', 'み', 'む', 'め', 'も', 'や', 'ゆ', 'よ', 'ら', 'り', 'る', 'れ', 'ろ', 'わ', 'を', 'ん'];
+    const vowels = [
+      'あ', 'い', 'う', 'え', 'お', 'か', 'き', 'く', 'け', 'こ',
+      'さ', 'し', 'す', 'せ', 'そ', 'た', 'ち', 'つ', 'て', 'と',
+      'な', 'に', 'ぬ', 'ね', 'の', 'は', 'ひ', 'ふ', 'へ', 'ほ',
+      'ま', 'み', 'む', 'め', 'も', 'や', 'ゆ', 'よ', 'ら', 'り',
+      'る', 'れ', 'ろ', 'わ', 'を', 'ん', 'が', 'ぎ', 'ぐ', 'げ',
+      'ご', 'ざ', 'じ', 'ず', 'ぜ', 'ぞ', 'だ', 'ぢ', 'づ', 'で',
+      'ど', 'ば', 'び', 'ぶ', 'べ', 'ぼ', 'ぱ', 'ぴ', 'ぷ', 'ぺ', 'ぽ'
+    ];
     const vcvPrefixes = ['- ', 'a ', 'i ', 'u ', 'e ', 'o ', 'n '];
     const otoLines = [];
 
@@ -433,7 +597,7 @@ app.post('/api/py/download-preset-voicebank', (req, res) => {
       const freq = 261.63 * Math.pow(2, (idx % 12) / 12);
 
       if (!fs.existsSync(wavPath)) {
-        fs.writeFileSync(wavPath, createWavBuffer(freq));
+        fs.writeFileSync(wavPath, createHumanVocalWavBuffer(v, freq));
       }
 
       otoLines.push(`${wavName}=${v},15,100,-40,25,10`);
@@ -516,11 +680,11 @@ app.get('/api/py/voicebank-details', async (req, res) => {
   }
 });
 
-// Helper function to resolve UTAU alias with intelligent fallback (VCV, plain, suffixes)
+// Helper function to resolve UTAU alias with intelligent fallback (VCV, plain, vowel fallback)
 function findAliasEntry(indexed, rawAlias) {
   if (!indexed || !indexed.aliasMap) return null;
   const aliasMap = indexed.aliasMap;
-  const alias = (rawAlias || '').trim();
+  const alias = (rawAlias || '').trim().normalize('NFC');
   if (!alias) return null;
 
   // 1. Exact match
@@ -544,7 +708,23 @@ function findAliasEntry(indexed, rawAlias) {
     }
   }
 
-  // 5. Fallback to first valid entry in indexed voicebank
+  // 5. Fallback vowel match for Japanese hiragana
+  const vowelMap = {
+    'あ': 'あ', 'か': 'あ', 'さ': 'あ', 'た': 'あ', 'な': 'あ', 'は': 'あ', 'ま': 'あ', 'や': 'あ', 'ら': 'あ', 'わ': 'あ', 'が': 'あ', 'ざ': 'あ', 'だ': 'あ', 'ば': 'あ', 'ぱ': 'あ',
+    'い': 'い', 'き': 'い', 'し': 'い', 'ち': 'い', 'に': 'い', 'ひ': 'い', 'み': 'い', 'り': 'い', 'ぎ': 'い', 'じ': 'い', 'ぢ': 'い', 'び': 'い', 'ぴ': 'い',
+    'う': 'う', 'く': 'う', 'す': 'う', 'つ': 'う', 'ぬ': 'う', 'ふ': 'う', 'む': 'う', 'ゆ': 'う', 'る': 'う', 'ぐ': 'う', 'ず': 'う', 'づ': 'う', 'ぶ': 'う', 'ぷ': 'う',
+    'え': 'え', 'け': 'え', 'せ': 'え', 'て': 'え', 'ね': 'え', 'へ': 'え', 'め': 'え', 'れ': 'え', 'げ': 'え', 'ぜ': 'え', 'で': 'え', 'べ': 'え', 'ぺ': 'え',
+    'お': 'お', 'こ': 'お', 'そ': 'お', 'と': 'お', 'の': 'お', 'ほ': 'お', 'も': 'お', 'よ': 'お', 'ろ': 'お', 'を': 'お', 'ご': 'お', 'ぞ': 'お', 'ど': 'お', 'ぼ': 'お', 'ぽ': 'お', 'ん': 'ん'
+  };
+  const targetVowel = vowelMap[alias] || vowelMap[cleanLyric];
+  if (targetVowel) {
+    if (aliasMap.has(targetVowel)) return aliasMap.get(targetVowel);
+    for (const p of prefixes) {
+      if (aliasMap.has(`${p}${targetVowel}`)) return aliasMap.get(`${p}${targetVowel}`);
+    }
+  }
+
+  // 6. Fallback to first valid entry in indexed voicebank
   if (indexed.entries && indexed.entries.length > 0) {
     return indexed.entries[0];
   }
@@ -554,6 +734,7 @@ function findAliasEntry(indexed, rawAlias) {
 
 // Resolve voicebank directory with smart matching (case-insensitive, substring, fallback)
 function resolveVoicebankPath(targetName) {
+  ensureDefaultVoicebanks();
   const baseDir = path.join(__dirname, 'temp', 'voicebanks');
   if (!fs.existsSync(baseDir)) {
     fs.mkdirSync(baseDir, { recursive: true });
@@ -596,19 +777,35 @@ function resolveVoicebankPath(targetName) {
   }
 }
 
-// Case-insensitive search for WAV file in directory
+// Robust search for WAV file in directory (NFC normalized, case-insensitive, recursive)
 function resolveWavFilePath(dirPath, filename) {
   if (!filename) return null;
-  const targetWav = path.join(dirPath, filename);
+  const normFilename = filename.normalize('NFC');
+  const targetWav = path.join(dirPath, normFilename);
   if (fs.existsSync(targetWav)) return targetWav;
 
   try {
-    const files = fs.readdirSync(dirPath);
-    const lowerFilename = filename.toLowerCase();
-    const match = files.find(f => f.toLowerCase() === lowerFilename);
-    if (match) {
-      return path.join(dirPath, match);
-    }
+    const lowerTarget = normFilename.toLowerCase();
+
+    const searchRecursive = (currentDir) => {
+      const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+        if (entry.isDirectory()) {
+          const found = searchRecursive(fullPath);
+          if (found) return found;
+        } else {
+          const entryNorm = entry.name.normalize('NFC');
+          if (entryNorm.toLowerCase() === lowerTarget) {
+            return fullPath;
+          }
+        }
+      }
+      return null;
+    };
+
+    const foundPath = searchRecursive(dirPath);
+    if (foundPath) return foundPath;
   } catch (e) {}
 
   return null;

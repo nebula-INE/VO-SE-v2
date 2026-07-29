@@ -216,11 +216,8 @@ export default function App() {
   useEffect(() => {
     if (isPlaying) {
       triggeredNotesSetRef.current.clear();
-      const isCustomVb = customVoicebanks.some((v) => v.name === selectedVoicebank);
-      if (isCustomVb) {
-        const uniqueLyrics = Array.from(new Set(notes.map((n) => n.lyric)));
-        uniqueLyrics.forEach((lyric) => fetchAndCacheSample(selectedVoicebank, lyric));
-      }
+      const uniqueLyrics = Array.from(new Set(notes.map((n) => n.lyric)));
+      uniqueLyrics.forEach((lyric) => fetchAndCacheSample(selectedVoicebank, lyric));
     } else {
       activeAudioNodesRef.current.forEach((node) => {
         try {
